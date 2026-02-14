@@ -43,6 +43,12 @@ void loop() {
     else if (incomingByte == 'S') {
       Serial.println(" -> ACTION: STOP");
     }
+    else if (incomingByte == 'X') {
+      Serial.println(" -> ACTION: LIGHT");
+    }
+    else if (incomingByte == 'Y') {
+      Serial.println(" -> ACTION: HORN");
+    }
     else {
       Serial.println(" -> [Unknown Command]");
     }
