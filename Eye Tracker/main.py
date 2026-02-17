@@ -2,185 +2,258 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import time
+import threading
+import queue
+import asyncio
+from bleak import BleakScanner, BleakClient
 
-# --- SENSITIVITY CONFIGURATION ---
-# Lower = More Sensitive. Higher = Harder to trigger.
-SENSITIVITY_X = 0.035  # Very sensitive for Left/Right
-SENSITIVITY_Y = 0.06   # Less sensitive for Up/Down (Harder to trigger)
+# ==============================================================================
+#                               CONFIG & TUNING
+# ==============================================================================
+DEVICE_NAME = "Wheelchair_BLE"
+CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+ENABLE_BLUETOOTH = True 
 
-# "Cone" Logic: How strict is the vertical check?
-# 0.5 means: "Unless Vertical movement is 2x stronger than Horizontal, assume Horizontal."
-# This creates a wide "Left/Right" zone and a narrow "Up/Down" strip.
-HORIZONTAL_BIAS = 0.5 
+# Control Thresholds
+THRESH_X = 0.040        
+THRESH_Y = 0.070        
+BIAS_HORIZONTAL = 0.6   
 
-BLINK_THRESHOLD = 5.0
-DOUBLE_BLINK_SPEED = 0.6 
+# Stability Settings
+CHANGE_COOLDOWN = 0.8   # Increased to 0.8s to stop rapid flipping
+BLINK_RATIO_LIMIT = 5.2
+DOUBLE_BLINK_INTERVAL = 0.6
 
-# --- INIT MEDIAPIPE ---
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True, 
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
-)
+# Kalman Filter Tuning
+PROCESS_NOISE = 1e-3    
+MEASURE_NOISE = 1e-1    
 
-# --- UTILS ---
-def get_euclidean_distance(p1, p2):
-    return np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
+# ==============================================================================
+#                            CORE CLASSES
+# ==============================================================================
 
-def get_iris_position(landmarks):
-    # RIGHT EYE INDICES
-    p_inner = landmarks[33] 
-    p_outer = landmarks[133]
-    p_iris = landmarks[468]
-    p_top = landmarks[159]
-    p_bottom = landmarks[145]
-    
-    # 1. Horizontal Ratio
-    eye_width = get_euclidean_distance(p_inner, p_outer)
-    dist_to_inner = get_euclidean_distance(p_iris, p_inner)
-    x_ratio = dist_to_inner / (eye_width + 1e-6)
-    
-    # 2. Vertical Ratio
-    eye_height = get_euclidean_distance(p_top, p_bottom)
-    dist_to_top = get_euclidean_distance(p_iris, p_top)
-    y_ratio = dist_to_top / (eye_height + 1e-6)
-    
-    return x_ratio, y_ratio
+class SignalStabilizer:
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * PROCESS_NOISE
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * MEASURE_NOISE
 
-def get_blink_ratio(landmarks):
-    top = landmarks[159]
-    bottom = landmarks[145]
-    v_dist = get_euclidean_distance(top, bottom)
-    inner = landmarks[33]
-    outer = landmarks[133]
-    h_dist = get_euclidean_distance(inner, outer)
-    return h_dist / (v_dist + 1e-6)
+    def update(self, raw_x, raw_y):
+        self.kf.predict()
+        measurement = np.array([[np.float32(raw_x)], [np.float32(raw_y)]])
+        self.kf.correct(measurement)
+        prediction = self.kf.statePost
+        return prediction[0][0], prediction[1][0]
 
-# --- MAIN LOOP ---
-cap = cv2.VideoCapture(0)
 
-# State Variables
-calibrated = False
-center_x, center_y = 0.0, 0.0
-current_state = "STOP"
-last_printed_state = ""
-last_blink_time = 0
-is_blinking = False
+class GazeTracker:
+    def __init__(self):
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.8,
+            min_tracking_confidence=0.8
+        )
 
-print("--- HORIZONTAL-BIASED CONTROLLER ---")
-print("1. Look at CENTER and press 'C' to Calibrate.")
+    def _euclidean_dist(self, p1, p2):
+        return np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
 
-while True:
-    ret, frame = cap.read()
-    if not ret: break
-    
-    frame = cv2.flip(frame, 1)
-    h, w, c = frame.shape
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb_frame)
-    
-    if results.multi_face_landmarks:
-        landmarks = results.multi_face_landmarks[0].landmark
+    def process_landmarks(self, landmarks):
+        P_INNER, P_OUTER = landmarks[33], landmarks[133]
+        P_TOP, P_BOTTOM = landmarks[159], landmarks[145]
+        P_IRIS = landmarks[468]
+
+        eye_w = self._euclidean_dist(P_INNER, P_OUTER)
+        eye_h = self._euclidean_dist(P_TOP, P_BOTTOM)
         
-        # 1. Get Data
-        raw_x, raw_y = get_iris_position(landmarks)
-        blink_ratio = get_blink_ratio(landmarks)
+        if eye_w == 0 or eye_h == 0: return 0, 0, 0
+
+        dist_x = self._euclidean_dist(P_IRIS, P_INNER)
+        dist_y = self._euclidean_dist(P_IRIS, P_TOP)
+
+        ratio_x = dist_x / eye_w
+        ratio_y = dist_y / eye_h
+        blink_metric = self._euclidean_dist(P_INNER, P_OUTER) / eye_h
         
-        # --- CALIBRATION ---
-        key = cv2.waitKey(1)
-        if key == ord('c') or key == ord('C'):
-            center_x, center_y = raw_x, raw_y
-            calibrated = True
-            current_state = "IDLE"
-            print(f"--- RE-CALIBRATED: {center_x:.2f}, {center_y:.2f} ---")
+        return ratio_x, ratio_y, blink_metric
 
-        if not calibrated:
-            cv2.rectangle(frame, (0,0), (w, h), (20, 20, 20), -1)
-            cv2.putText(frame, "LOOK CENTER & PRESS 'C'", (50, h//2), 
-                        cv2.FONT_HERSHEY_DUPLEX, 1, (0, 255, 255), 2)
-            cv2.imshow("Eye Controller", frame)
-            continue
 
-        # --- BLINK LOGIC ---
-        if blink_ratio > BLINK_THRESHOLD:
-            if not is_blinking:
-                is_blinking = True
-                curr_time = time.time()
-                if (curr_time - last_blink_time) < DOUBLE_BLINK_SPEED:
-                    if current_state == "STOP":
-                        current_state = "IDLE"
-                    else:
-                        current_state = "STOP"
-                last_blink_time = curr_time
+class WheelchairDriver:
+    def __init__(self):
+        self.stabilizer = SignalStabilizer()
+        self.calibrated = False
+        self.center_x = 0.0
+        self.center_y = 0.0
+        
+        self.current_state = "STOP"
+        self.last_sent_cmd = ""
+        self.last_state_change_time = 0
+        
+        self.blink_active = False
+        self.last_blink_time = 0
+        
+        self.command_queue = queue.Queue()
+        self.running = True
+        
+        if ENABLE_BLUETOOTH:
+            self.bt_thread = threading.Thread(target=self._bluetooth_worker, daemon=True)
+            self.bt_thread.start()
+
+    def _bluetooth_worker(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def async_task():
+            while self.running: # Auto-Reconnect Loop
+                print(f"[BLE] Scanning for {DEVICE_NAME}...")
+                try:
+                    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=5.0)
+                    if not device:
+                        print(f"[BLE] ❌ Not Found. Retrying in 2s...")
+                        await asyncio.sleep(2.0)
+                        continue
+
+                    print(f"[BLE] ✅ Connecting...")
+                    async with BleakClient(device) as client:
+                        print(f"[BLE] ✅ CONNECTED!")
+                        last_msg = ""
+                        
+                        while self.running and client.is_connected:
+                            try:
+                                cmd = self.command_queue.get(timeout=0.1)
+                                
+                                protocol_map = {"FORWARD": b'F', "REVERSE": b'B', 
+                                                "LEFT": b'L', "RIGHT": b'R', 
+                                                "STOP": b'S', "IDLE": b'S'}
+                                char_code = protocol_map.get(cmd, b'S')
+                                
+                                if cmd != last_msg:
+                                    print(f"[BLE] Sending: {cmd}")
+                                    await client.write_gatt_char(CHARACTERISTIC_UUID, char_code, response=False)
+                                    last_msg = cmd
+                                    
+                            except queue.Empty:
+                                continue
+                            except Exception as e:
+                                print(f"[BLE] Transmission Error: {e}")
+                                break # Break inner loop to trigger reconnect
+                        
+                        print("[BLE] Disconnected. Reconnecting...")
+
+                except Exception as e:
+                    print(f"[BLE] Connection Error: {e}")
+                    await asyncio.sleep(2.0)
+
+        loop.run_until_complete(async_task())
+        loop.close()
+
+    def send_command(self, cmd):
+        if ENABLE_BLUETOOTH:
+            self.command_queue.put(cmd)
         else:
-            is_blinking = False
+            if cmd != self.last_sent_cmd:
+                print(f"[TEST] Logic Command: {cmd}")
+                self.last_sent_cmd = cmd
 
-        # --- DIRECTION LOGIC (HORIZONTAL PRIORITY) ---
-        if not is_blinking and current_state == "IDLE":
-            # Deviation from center
-            dx = raw_x - center_x
-            dy = raw_y - center_y
-            
-            mag_x = abs(dx)
-            mag_y = abs(dy)
-            
-            new_cmd = None
-
-            # PRIORITY CHECK:
-            # We check Horizontal FIRST with a low barrier.
-            # We only allow Vertical if it is significantly stronger than horizontal.
-            
-            # 1. Check Horizontal (The "Wide Cone")
-            # Logic: If you moved enough in X, AND your X movement is stronger than 
-            # half your Y movement, it's Left/Right.
-            if mag_x > SENSITIVITY_X and mag_x > (mag_y * HORIZONTAL_BIAS): 
-                if dx < 0: new_cmd = "LEFT"
-                else: new_cmd = "RIGHT"
-            
-            # 2. Check Vertical (The "Narrow Strip")
-            # Logic: If we didn't trigger Left/Right, AND we moved enough in Y...
-            elif mag_y > SENSITIVITY_Y:
-                # Vertical Dominant
-                # Note: Y is inverted (Negative = Up/Forward)
-                if dy < 0: new_cmd = "FORWARD"
-                else: new_cmd = "REVERSE"
-
-            if new_cmd:
-                current_state = new_cmd
-
-        # --- VISUALIZATION ---
-        color = (0, 0, 255)
-        if current_state == "IDLE": color = (0, 255, 255)
-        if current_state in ["LEFT", "RIGHT", "FORWARD", "REVERSE"]: color = (0, 255, 0)
+    def update_logic(self, raw_x, raw_y, blink_val):
+        smooth_x, smooth_y = self.stabilizer.update(raw_x, raw_y)
         
-        # Center Cross
-        cx, cy = int(w/2), int(h/2)
-        cv2.line(frame, (cx-20, cy), (cx+20, cy), (100, 100, 100), 1)
-        cv2.line(frame, (cx, cy-20), (cx, cy+20), (100, 100, 100), 1)
-        
-        # Gaze Vector
-        gx = int(cx + (raw_x - center_x) * 1000)
-        gy = int(cy + (raw_y - center_y) * 1000)
-        cv2.arrowedLine(frame, (cx, cy), (gx, gy), color, 3)
-        
-        # UI Text
-        cv2.putText(frame, f"CMD: {current_state}", (20, 50), 
-                    cv2.FONT_HERSHEY_DUPLEX, 1.5, color, 2)
-        
-        # Debug Weights
-        debug_color = (200, 200, 200)
-        cv2.putText(frame, f"X-Mag: {abs(raw_x - center_x):.3f}", (20, h-60), cv2.FONT_HERSHEY_PLAIN, 1, debug_color, 1)
-        cv2.putText(frame, f"Y-Mag: {abs(raw_y - center_y):.3f}", (20, h-40), cv2.FONT_HERSHEY_PLAIN, 1, debug_color, 1)
+        if blink_val > BLINK_RATIO_LIMIT:
+            if not self.blink_active:
+                self.blink_active = True
+                now = time.time()
+                if (now - self.last_blink_time) < DOUBLE_BLINK_INTERVAL:
+                    self.current_state = "IDLE" if self.current_state == "STOP" else "STOP"
+                self.last_blink_time = now
+        else:
+            self.blink_active = False
 
-    # Output
-    if current_state != last_printed_state:
-        print(f"DEVICE_SIGNAL: {current_state}")
-        last_printed_state = current_state
+        if self.calibrated and not self.blink_active and self.current_state != "STOP":
+            now = time.time()
+            
+            # --- COOLDOWN CHECK ---
+            if (now - self.last_state_change_time) < CHANGE_COOLDOWN:
+                return smooth_x, smooth_y, self.current_state
 
-    cv2.imshow("Eye Controller", frame)
-    if cv2.waitKey(1) & 0xFF == 27: break
+            dx = smooth_x - self.center_x
+            dy = smooth_y - self.center_y
+            mag_x, mag_y = abs(dx), abs(dy)
+            new_cmd = "IDLE"
 
-cap.release()
-cv2.destroyAllWindows()
+            if mag_x > THRESH_X and mag_x > (mag_y * BIAS_HORIZONTAL):
+                new_cmd = "LEFT" if dx < 0 else "RIGHT"
+            elif mag_y > THRESH_Y:
+                new_cmd = "FORWARD" if dy < 0 else "REVERSE"
+            
+            if new_cmd != self.current_state:
+                self.current_state = new_cmd
+                self.last_state_change_time = now
+
+        return smooth_x, smooth_y, self.current_state
+
+    def calibrate(self, x, y):
+        self.center_x = x
+        self.center_y = y
+        self.calibrated = True
+        print(f"[SYS] Calibrated: {x:.3f}, {y:.3f}")
+
+
+def run_system():
+    driver = WheelchairDriver()
+    tracker = GazeTracker()
+    cap = cv2.VideoCapture(0)
+    
+    print("--- SYSTEM READY: Press 'C' to Calibrate, 'ESC' to Quit ---")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = tracker.face_mesh.process(rgb)
+
+        if results.multi_face_landmarks:
+            landmarks = results.multi_face_landmarks[0].landmark
+            
+            rx, ry, blink = tracker.process_landmarks(landmarks)
+            sx, sy, state = driver.update_logic(rx, ry, blink)
+            
+            # Queue Command
+            if state != driver.last_sent_cmd:
+                driver.send_command(state)
+                driver.last_sent_cmd = state
+            
+            if cv2.waitKey(1) in [ord('c'), ord('C')]:
+                driver.calibrate(sx, sy)
+
+            # --- VISUALIZATION ---
+            color = (0, 0, 255) 
+            if state == "IDLE": color = (0, 255, 255)
+            elif state != "STOP": color = (0, 255, 0)
+            
+            if driver.calibrated:
+                cx, cy = w // 2, h // 2
+                gx = int(cx + (sx - driver.center_x) * 1000)
+                gy = int(cy + (sy - driver.center_y) * 1000)
+                cv2.arrowedLine(frame, (cx, cy), (gx, gy), color, 3, tipLength=0.3)
+            
+            cv2.putText(frame, f"CMD: {state}", (20, 50), cv2.FONT_HERSHEY_DUPLEX, 1.2, color, 2)
+            if not driver.calibrated:
+                cv2.putText(frame, "LOOK CENTER & PRESS 'C'", (w//4, h//2), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        
+        cv2.imshow("Gaze Command Unit", frame)
+        if cv2.waitKey(1) == 27: 
+            break
+
+    driver.running = False
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    run_system()

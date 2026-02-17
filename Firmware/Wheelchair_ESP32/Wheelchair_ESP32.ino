@@ -1,116 +1,139 @@
-/*
- * Project: Eye-Controlled Wheelchair (ESP32 Upgrade)
- * Author: Harshavardhan Talap
- * Features: Bluetooth Serial, Safety Timeout, Speed Control
- */
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-#include "BluetoothSerial.h"
+// --- CONFIGURATION ---
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-// Check if Bluetooth is properly enabled in settings
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
-#endif
+// Motor Pins
+#define ENA 13
+#define IN1 18
+#define IN2 19
+#define IN3 14
+#define IN4 27
+#define ENB 23
+#define LED_PIN 2
 
-BluetoothSerial SerialBT;
-
-// --- PIN MAPPING (Safe GPIOs) ---
-// Left Motors
-const int ENA = 13;
-const int IN1 = 18;
-const int IN2 = 19;
-// Right Motors
-const int IN3 = 14;
-const int IN4 = 27;
-const int ENB = 23;
-
-// --- VARIABLES ---
-int valSpeed = 255; // Max speed (0-255)
-char command = 'S';
+// Variables
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
 unsigned long lastCommandTime = 0;
-const long SAFETY_TIMEOUT = 1000; // Stop after 1 second of silence
 
-void setup() {
-  Serial.begin(115200); // USB Debug
-  
-  // 1. Start Bluetooth with a specific name
-  SerialBT.begin("Wheelchair_ESP32"); 
-  Serial.println("Bluetooth Started! Pair with 'Wheelchair_ESP32'");
-
-  // 2. Configure Pins
-  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
-
-  stopMotors();
-}
-
-void loop() {
-  // A. Receive Command from PC/Python
-  if (SerialBT.available()) {
-    command = SerialBT.read();
-    lastCommandTime = millis();
-    Serial.print("Received: "); Serial.println(command);
-    processCommand(command);
-  }
-
-  // B. Safety Timeout (Crucial for Eye Tracking)
-  // If Python crashes or eye closes, robot MUST stop.
-  if (millis() - lastCommandTime > SAFETY_TIMEOUT) {
-    if (command != 'S') {
-      stopMotors();
-      command = 'S';
-      Serial.println("Safety Stop: Signal Lost");
-    }
-  }
-}
-
-void processCommand(char cmd) {
-  switch (cmd) {
-    case 'F': moveForward(); break;
-    case 'B': moveBackward(); break;
-    case 'L': turnLeft(); break;
-    case 'R': turnRight(); break;
-    case 'S': stopMotors(); break;
-    
-    // Speed Control (0-9)
-    case '0': setSpeed(0); break;
-    case '1': setSpeed(50); break;
-    case '3': setSpeed(100); break;
-    case '5': setSpeed(150); break;
-    case '7': setSpeed(200); break;
-    case '9': setSpeed(255); break;
-  }
-}
-
-// --- DRIVER FUNCTIONS ---
-void setSpeed(int s) {
-  valSpeed = s;
-  analogWrite(ENA, valSpeed);
-  analogWrite(ENB, valSpeed);
+// --- MOTOR CONTROL ---
+void stopMotors() {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+    analogWrite(ENA, 0); analogWrite(ENB, 0);
 }
 
 void moveForward() {
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); analogWrite(ENA, valSpeed);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, valSpeed);
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+    analogWrite(ENA, 200); analogWrite(ENB, 200);
 }
 
 void moveBackward() {
-  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, valSpeed);
-  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, valSpeed);
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+    analogWrite(ENA, 200); analogWrite(ENB, 200);
 }
 
 void turnLeft() {
-  // Differential Spin
-  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, valSpeed);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, valSpeed);
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+    analogWrite(ENA, 180); analogWrite(ENB, 180);
 }
 
 void turnRight() {
-  // Differential Spin
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); analogWrite(ENA, valSpeed);
-  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, valSpeed);
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+    analogWrite(ENA, 180); analogWrite(ENB, 180);
 }
 
-void stopMotors() {
-  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); analogWrite(ENA, 0);
-  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); analogWrite(ENB, 0);
+// --- CALLBACKS ---
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+        digitalWrite(LED_PIN, HIGH);
+        Serial.println("Device Connected");
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+        digitalWrite(LED_PIN, LOW);
+        stopMotors();
+        Serial.println("Device Disconnected");
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        // FIX: Use Arduino 'String' instead of 'std::string'
+        String value = pCharacteristic->getValue(); 
+        
+        if (value.length() > 0) {
+            char cmd = value[0]; // Get the first character
+            Serial.print("Received: "); Serial.println(cmd);
+            lastCommandTime = millis(); 
+
+            if (cmd == 'F') moveForward();
+            else if (cmd == 'B') moveBackward();
+            else if (cmd == 'L') turnLeft();
+            else if (cmd == 'R') turnRight();
+            else stopMotors();
+        }
+    }
+};
+
+void setup() {
+    Serial.begin(115200);
+    
+    pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+    pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+    pinMode(LED_PIN, OUTPUT);
+    
+    stopMotors();
+
+    BLEDevice::init("Wheelchair_BLE");
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+
+    pCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_WRITE
+    );
+
+    pCharacteristic->setCallbacks(new MyCallbacks());
+    pService->start();
+
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);  
+    pAdvertising->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+    
+    Serial.println("Waiting for a client connection...");
+}
+
+void loop() {
+    // --- DISCONNECTION HANDLER ---
+    if (!deviceConnected && oldDeviceConnected) {
+        delay(500); 
+        pServer->startAdvertising(); 
+        Serial.println("Restarting Advertising...");
+        oldDeviceConnected = deviceConnected;
+    }
+
+    if (deviceConnected && !oldDeviceConnected) {
+        oldDeviceConnected = deviceConnected;
+    }
 }
