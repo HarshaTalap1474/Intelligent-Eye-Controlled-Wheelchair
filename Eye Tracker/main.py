@@ -11,7 +11,8 @@ from bleak import BleakScanner, BleakClient
 #                               CONFIG & TUNING
 # ==============================================================================
 DEVICE_NAME = "Wheelchair_BLE"
-CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+CHARACTERISTIC_UUID_RX = "beb5483e-36e1-4688-b7f5-ea07361b26a8" # Send Commands Here
+CHARACTERISTIC_UUID_TX = "1c28c688-29ce-44d5-ab46-5991444903bc" # Listen for Data Here
 ENABLE_BLUETOOTH = True 
 
 # Control Thresholds
@@ -20,9 +21,9 @@ THRESH_Y = 0.070
 BIAS_HORIZONTAL = 0.6   
 
 # Pulse Timing (Matches ESP32 Logic)
-TIME_LONG_MOVE = 5.0     # Forward (5s)
-TIME_REVERSE_MOVE = 2.0  # Reverse (2s) <-- NEW
-TIME_SHORT_MOVE = 0.8    # Left/Right (0.8s)
+TIME_LONG_MOVE = 5.0   
+TIME_REVERSE_MOVE = 2.0 
+TIME_SHORT_MOVE = 0.8  
 
 # Stability Settings
 BLINK_RATIO_LIMIT = 5.2
@@ -37,7 +38,6 @@ MEASURE_NOISE = 1e-1
 # ==============================================================================
 
 class SignalStabilizer:
-    """ Uses Kalman Filter to smooth out jittery eye tracking data. """
     def __init__(self):
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
@@ -54,7 +54,6 @@ class SignalStabilizer:
 
 
 class GazeTracker:
-    """ Handles Camera Input and MediaPipe math. """
     def __init__(self):
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
@@ -88,7 +87,6 @@ class GazeTracker:
 
 
 class WheelchairDriver:
-    """ Manages Logic and runs Bluetooth in a BACKGROUND THREAD. """
     def __init__(self):
         self.stabilizer = SignalStabilizer()
         self.calibrated = False
@@ -105,12 +103,29 @@ class WheelchairDriver:
         self.blink_active = False
         self.last_blink_time = 0
         
+        # Telemetry Variables (Live Sensor Data)
+        self.front_dist = 999
+        self.rear_dist = 999
+        
         self.command_queue = queue.Queue()
         self.running = True
         
         if ENABLE_BLUETOOTH:
             self.bt_thread = threading.Thread(target=self._bluetooth_worker, daemon=True)
             self.bt_thread.start()
+
+    def _telemetry_handler(self, sender, data: bytearray):
+        """ Catches the data broadcasted by the ESP32 and decodes it. """
+        try:
+            msg = data.decode("utf-8") # Example: "F:45,R:120"
+            parts = msg.split(",")
+            for p in parts:
+                if p.startswith("F:"):
+                    self.front_dist = int(p.split(":")[1])
+                elif p.startswith("R:"):
+                    self.rear_dist = int(p.split(":")[1])
+        except Exception as e:
+            pass # Ignore corrupted packets
 
     def _bluetooth_worker(self):
         loop = asyncio.new_event_loop()
@@ -122,15 +137,17 @@ class WheelchairDriver:
                 try:
                     device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=5.0)
                     if not device:
-                        print(f"[BLE] ❌ Not Found. Retrying in 2s...")
                         await asyncio.sleep(2.0)
                         continue
 
                     print(f"[BLE] ✅ Connecting...")
                     async with BleakClient(device) as client:
                         print(f"[BLE] ✅ CONNECTED!")
-                        last_msg = ""
                         
+                        # Subscribe to Telemetry (The Bidirectional Upgrade)
+                        await client.start_notify(CHARACTERISTIC_UUID_TX, self._telemetry_handler)
+                        
+                        last_msg = ""
                         while self.running and client.is_connected:
                             try:
                                 cmd = self.command_queue.get(timeout=0.1)
@@ -140,27 +157,22 @@ class WheelchairDriver:
                                                 "STOP": b'S', "IDLE": b'S'}
                                 char_code = protocol_map.get(cmd, b'S')
                                 
-                                # Priority: Send STOP immediately
                                 if cmd == "STOP":
-                                    print(f"[BLE] 🛑 EMERGENCY STOP SENT")
-                                    await client.write_gatt_char(CHARACTERISTIC_UUID, b'S', response=False)
+                                    await client.write_gatt_char(CHARACTERISTIC_UUID_RX, b'S', response=False)
                                     last_msg = cmd
-                                # Otherwise, only send if changed
                                 elif cmd != last_msg:
                                     print(f"[BLE] Sending: {cmd}")
-                                    await client.write_gatt_char(CHARACTERISTIC_UUID, char_code, response=False)
+                                    await client.write_gatt_char(CHARACTERISTIC_UUID_RX, char_code, response=False)
                                     last_msg = cmd
                                     
                             except queue.Empty:
                                 continue
                             except Exception as e:
-                                print(f"[BLE] Transmission Error: {e}")
                                 break 
                         
                         print("[BLE] Disconnected. Reconnecting...")
 
                 except Exception as e:
-                    print(f"[BLE] Connection Error: {e}")
                     await asyncio.sleep(2.0)
 
         loop.run_until_complete(async_task())
@@ -169,81 +181,57 @@ class WheelchairDriver:
     def send_command(self, cmd):
         if ENABLE_BLUETOOTH:
             self.command_queue.put(cmd)
-        else:
-            if cmd != self.last_sent_cmd:
-                print(f"[TEST] Logic Command: {cmd}")
-                self.last_sent_cmd = cmd
 
     def update_logic(self, raw_x, raw_y, blink_val):
         smooth_x, smooth_y = self.stabilizer.update(raw_x, raw_y)
         now = time.time()
 
-        # --- 1. BLINK DETECTION (The Master Key) ---
-        # This runs FIRST to handle Unlocking from STOP
+        # 1. BLINK DETECTION
         if blink_val > BLINK_RATIO_LIMIT:
             if not self.blink_active:
                 self.blink_active = True
-                # Check for DOUBLE BLINK
                 if (now - self.last_blink_time) < DOUBLE_BLINK_INTERVAL:
-                    print("!!! DOUBLE BLINK DETECTED !!!")
-                    
-                    # TOGGLE LOGIC:
                     if self.current_state == "STOP":
-                        self.current_state = "IDLE" # UNLOCK
+                        self.current_state = "IDLE"
                         self.pulse_active = False
-                        print("-> SYSTEM UNLOCKED (IDLE)")
                     else:
-                        self.current_state = "STOP" # LOCK
+                        self.current_state = "STOP"
                         self.pulse_active = False
-                        print("-> EMERGENCY STOP (LOCKED)")
-                    
                     self.last_blink_time = 0 
                     return smooth_x, smooth_y, self.current_state
-
                 self.last_blink_time = now
         else:
             self.blink_active = False
 
-        # --- 2. STOP STATE LOCKOUT ---
-        if self.current_state == "STOP":
-            return smooth_x, smooth_y, "STOP"
+        if self.current_state == "STOP": return smooth_x, smooth_y, "STOP"
 
-        # --- 3. PULSE TIMER CHECK ---
-        # If moving, lock logic until time is up
+        # 2. PULSE TIMER CHECK
         if self.pulse_active:
             if now < self.pulse_end_time:
-                return smooth_x, smooth_y, self.current_state # Continue Pulse
+                return smooth_x, smooth_y, self.current_state
             else:
                 self.pulse_active = False
                 self.current_state = "IDLE"
-                return smooth_x, smooth_y, "IDLE" # Pulse Done
+                return smooth_x, smooth_y, "IDLE"
 
-        # --- 4. NEW COMMAND DETECTION ---
+        # 3. NEW COMMAND DETECTION
         if self.calibrated:
             dx = smooth_x - self.center_x
             dy = smooth_y - self.center_y
             mag_x, mag_y = abs(dx), abs(dy)
             new_cmd = "IDLE"
 
-            # Cone Logic
             if mag_x > THRESH_X and mag_x > (mag_y * BIAS_HORIZONTAL):
                 new_cmd = "LEFT" if dx < 0 else "RIGHT"
             elif mag_y > THRESH_Y:
                 new_cmd = "FORWARD" if dy < 0 else "REVERSE"
             
-            # Start New Pulse with specific timing for each direction
             if new_cmd != "IDLE":
                 self.current_state = new_cmd
                 self.pulse_active = True
-                
-                # Set Timer based on move type
-                if new_cmd == "FORWARD":
-                    self.pulse_end_time = now + TIME_LONG_MOVE
-                elif new_cmd == "REVERSE":
-                    self.pulse_end_time = now + TIME_REVERSE_MOVE # Uses 2.0s
-                else:
-                    # Left / Right
-                    self.pulse_end_time = now + TIME_SHORT_MOVE
+                if new_cmd == "FORWARD": self.pulse_end_time = now + TIME_LONG_MOVE
+                elif new_cmd == "REVERSE": self.pulse_end_time = now + TIME_REVERSE_MOVE
+                else: self.pulse_end_time = now + TIME_SHORT_MOVE
 
         return smooth_x, smooth_y, self.current_state
 
@@ -251,7 +239,13 @@ class WheelchairDriver:
         self.center_x = x
         self.center_y = y
         self.calibrated = True
-        print(f"[SYS] Calibrated: {x:.3f}, {y:.3f}")
+
+
+def get_dist_color(dist):
+    """ Dynamic color coding for the radar display. """
+    if dist > 60: return (0, 255, 0)      # Safe (Green)
+    if dist > 30: return (0, 255, 255)    # Warning (Yellow)
+    return (0, 0, 255)                    # Danger (Red)
 
 
 def run_system():
@@ -276,7 +270,6 @@ def run_system():
             rx, ry, blink = tracker.process_landmarks(landmarks)
             sx, sy, state = driver.update_logic(rx, ry, blink)
             
-            # Send Command
             if state != driver.last_sent_cmd:
                 driver.send_command(state)
                 driver.last_sent_cmd = state
@@ -284,29 +277,48 @@ def run_system():
             if cv2.waitKey(1) in [ord('c'), ord('C')]:
                 driver.calibrate(sx, sy)
 
-            # --- VISUALIZATION ---
+            # --- VISUALIZATION / HEADS-UP DISPLAY (HUD) ---
             color = (0, 0, 255) 
             if state == "IDLE": color = (0, 255, 255)
             elif state != "STOP": color = (0, 255, 0)
             
+            # Draw Gaze Arrow
             if driver.calibrated:
                 cx, cy = w // 2, h // 2
                 gx = int(cx + (sx - driver.center_x) * 1000)
                 gy = int(cy + (sy - driver.center_y) * 1000)
                 cv2.arrowedLine(frame, (cx, cy), (gx, gy), color, 3, tipLength=0.3)
                 
-                # Show Pulse Countdown
                 if driver.pulse_active:
                     remaining = int(driver.pulse_end_time - time.time())
                     cv2.putText(frame, f"DRIVING... {remaining}s", (cx-50, cy+60), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            cv2.putText(frame, f"CMD: {state}", (20, 50), cv2.FONT_HERSHEY_DUPLEX, 1.2, color, 2)
-            if not driver.calibrated:
+            else:
                 cv2.putText(frame, "LOOK CENTER & PRESS 'C'", (w//4, h//2), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
+            # Current Command State
+            cv2.putText(frame, f"CMD: {state}", (20, 50), cv2.FONT_HERSHEY_DUPLEX, 1.0, color, 2)
+
+            # LIVE SENSOR TELEMETRY
+            f_color = get_dist_color(driver.front_dist)
+            r_color = get_dist_color(driver.rear_dist)
+            
+            # Display Distances (Uses 999 to show CLEAR)
+            f_text = f"FRONT: {driver.front_dist}cm" if driver.front_dist != 999 else "FRONT: CLEAR"
+            r_text = f"REAR: {driver.rear_dist}cm" if driver.rear_dist != 999 else "REAR: CLEAR"
+
+            cv2.putText(frame, f_text, (w - 280, 50), cv2.FONT_HERSHEY_DUPLEX, 0.8, f_color, 2)
+            cv2.putText(frame, r_text, (w - 280, 90), cv2.FONT_HERSHEY_DUPLEX, 0.8, r_color, 2)
+
+            # MASSIVE DANGER WARNING (Central Screen Overlay)
+            if driver.front_dist < 30 or driver.rear_dist < 30:
+                cv2.putText(frame, "OBSTACLE WARNING", (w//2 - 220, h//2 + 120),
+                            cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 0, 255), 3)
+                cv2.putText(frame, "SYSTEM BRAKING", (w//2 - 130, h//2 + 160),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 2)
         
-        cv2.imshow("Gaze Command Unit", frame)
+        cv2.imshow("IrisDrive HUD Unit", frame)
         if cv2.waitKey(1) == 27: 
             break
 
