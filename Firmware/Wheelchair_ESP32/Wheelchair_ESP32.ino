@@ -4,11 +4,11 @@
 #include <BLE2902.h>
 
 // --- CONFIGURATION ---
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID_RX "beb5483e-36e1-4688-b7f5-ea07361b26a8" // Python Writes Here
+#define CHARACTERISTIC_UUID_TX "1c28c688-29ce-44d5-ab46-5991444903bc" // ESP32 Sends Here (NEW)
 
 // --- PIN DEFINITIONS ---
-// Motor Pins
 #define ENA 13
 #define IN1 18
 #define IN2 19
@@ -24,20 +24,23 @@
 #define REAR_ECHO 33
 
 // --- TIMING & DISTANCE CONFIGURATION ---
-#define MOVE_TIME_LONG  5000  // 5 Seconds for Forward
-#define MOVE_TIME_REV   2000  // 2 Seconds for Reverse
-#define MOVE_TIME_SHORT 800   // 0.8 Seconds for Left/Right
-#define OBSTACLE_DIST   30    // Stop if closer than 30cm
+#define MOVE_TIME_LONG  5000  // 5s Forward
+#define MOVE_TIME_REV   2000  // 2s Reverse
+#define MOVE_TIME_SHORT 800   // 0.8s Turn
+#define OBSTACLE_DIST   30    // Stop if < 30cm
+#define TELEMETRY_RATE  300   // Send data every 300ms (NEW)
 
 // Variables
 BLEServer* pServer = NULL;
-BLECharacteristic* pCharacteristic = NULL;
+BLECharacteristic* pRxCharacteristic = NULL;
+BLECharacteristic* pTxCharacteristic = NULL; // NEW
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
 // State Machine
 unsigned long moveStartTime = 0;
 unsigned long moveDuration = 0;
+unsigned long lastTelemetryTime = 0; // NEW
 bool isMoving = false;
 char currentAction = 'S';
 
@@ -82,9 +85,8 @@ int getDistance(int trigPin, int echoPin) {
     delayMicroseconds(10);
     digitalWrite(trigPin, LOW);
     
-    // 30ms timeout prevents freezing
     long duration = pulseIn(echoPin, HIGH, 30000); 
-    if (duration == 0) return 999; // No echo = clear path
+    if (duration == 0) return 999; 
     return duration * 0.034 / 2;
 }
 
@@ -104,44 +106,24 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
-class MyCallbacks: public BLECharacteristicCallbacks {
+class MyRxCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
         String value = pCharacteristic->getValue();
         if (value.length() > 0) {
             char cmd = value[0];
             
-            // Ignore if already executing this command
             if (isMoving && cmd == currentAction) return;
 
-            // EMERGENCY STOP
             if (cmd == 'S') {
-                Serial.println("CMD: EMERGENCY STOP");
                 stopMotors();
                 return;
             }
 
-            // --- SMART START LOGIC (Obstacle Pre-Check) ---
-            if (cmd == 'F') {
-                if (getDistance(FRONT_TRIG, FRONT_ECHO) < OBSTACLE_DIST) {
-                    Serial.println("CMD: F - REJECTED (Front Blocked)");
-                    return;
-                }
-                moveDuration = MOVE_TIME_LONG; 
-                
-            } else if (cmd == 'B') {
-                if (getDistance(REAR_TRIG, REAR_ECHO) < OBSTACLE_DIST) {
-                    Serial.println("CMD: B - REJECTED (Rear Blocked)");
-                    return;
-                }
-                moveDuration = MOVE_TIME_REV;  
-                
-            } else if (cmd == 'L' || cmd == 'R') {
-                moveDuration = MOVE_TIME_SHORT; 
-            } else {
-                return;
-            }
+            if (cmd == 'F') moveDuration = MOVE_TIME_LONG; 
+            else if (cmd == 'B') moveDuration = MOVE_TIME_REV;  
+            else if (cmd == 'L' || cmd == 'R') moveDuration = MOVE_TIME_SHORT; 
+            else return;
 
-            // --- EXECUTE MOVE ---
             moveStartTime = millis();
             isMoving = true;
             currentAction = cmd;
@@ -150,8 +132,6 @@ class MyCallbacks: public BLECharacteristicCallbacks {
             else if (cmd == 'B') moveBackward();
             else if (cmd == 'L') turnLeft();
             else if (cmd == 'R') turnRight();
-            
-            Serial.print("CMD Executed: "); Serial.println(cmd);
         }
     }
 };
@@ -159,13 +139,11 @@ class MyCallbacks: public BLECharacteristicCallbacks {
 void setup() {
     Serial.begin(115200);
     
-    // Motor Pins
     pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
     pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
     pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
     pinMode(LED_PIN, OUTPUT);
     
-    // Sensor Pins
     pinMode(FRONT_TRIG, OUTPUT); pinMode(FRONT_ECHO, INPUT);
     pinMode(REAR_TRIG, OUTPUT);  pinMode(REAR_ECHO, INPUT);
 
@@ -176,12 +154,21 @@ void setup() {
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
     BLEService *pService = pServer->createService(SERVICE_UUID);
-    pCharacteristic = pService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_READ |
+    
+    // 1. Create RX Characteristic (For receiving commands from Python)
+    pRxCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID_RX,
         BLECharacteristic::PROPERTY_WRITE
     );
-    pCharacteristic->setCallbacks(new MyCallbacks());
+    pRxCharacteristic->setCallbacks(new MyRxCallbacks());
+
+    // 2. Create TX Characteristic (For sending data to Python)
+    pTxCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID_TX,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pTxCharacteristic->addDescriptor(new BLE2902()); // Required for Notifications
+
     pService->start();
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
@@ -192,39 +179,47 @@ void setup() {
 }
 
 void loop() {
-    // 1. Connection Recovery
+    unsigned long currentMillis = millis();
+
     if (!deviceConnected && oldDeviceConnected) {
         delay(500); 
         pServer->startAdvertising(); 
         oldDeviceConnected = deviceConnected;
-        Serial.println("Advertising Restarted.");
     }
     if (deviceConnected && !oldDeviceConnected) {
         oldDeviceConnected = deviceConnected;
     }
 
-    // 2. ACTIVE MOVEMENT MONITORING
-    if (isMoving) {
-        unsigned long elapsed = millis() - moveStartTime;
+    // --- TELEMETRY & COLLISION RADAR ---
+    // Runs every 300ms so we don't flood the Bluetooth connection
+    if (currentMillis - lastTelemetryTime >= TELEMETRY_RATE) {
+        lastTelemetryTime = currentMillis;
 
-        // A. Collision Detection while moving
-        if (currentAction == 'F') {
-            if (getDistance(FRONT_TRIG, FRONT_ECHO) < OBSTACLE_DIST) {
-                Serial.println("ALERT: Front Obstacle! Braking!");
-                stopMotors();
-                return;
-            }
-        } else if (currentAction == 'B') {
-            if (getDistance(REAR_TRIG, REAR_ECHO) < OBSTACLE_DIST) {
-                Serial.println("ALERT: Rear Obstacle! Braking!");
-                stopMotors();
-                return;
-            }
+        int fDist = getDistance(FRONT_TRIG, FRONT_ECHO);
+        int rDist = getDistance(REAR_TRIG, REAR_ECHO);
+
+        // Send Data to Python (Format: "F:45,R:120")
+        if (deviceConnected) {
+            String payload = "F:" + String(fDist) + ",R:" + String(rDist);
+            pTxCharacteristic->setValue(payload.c_str());
+            pTxCharacteristic->notify(); // Push to Python
         }
 
-        // B. Timer check
-        if (elapsed >= moveDuration) {
-            Serial.println("Pulse Complete - Coasting to Stop.");
+        // Active Collision Avoidance
+        if (isMoving) {
+            if (currentAction == 'F' && fDist < OBSTACLE_DIST) {
+                Serial.println("Front Obstacle! Braking!");
+                stopMotors();
+            } else if (currentAction == 'B' && rDist < OBSTACLE_DIST) {
+                Serial.println("Rear Obstacle! Braking!");
+                stopMotors();
+            }
+        }
+    }
+
+    // --- PULSE TIMER ---
+    if (isMoving) {
+        if (currentMillis - moveStartTime >= moveDuration) {
             stopMotors();
         }
     }
