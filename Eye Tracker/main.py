@@ -19,8 +19,12 @@ THRESH_X = 0.040
 THRESH_Y = 0.070        
 BIAS_HORIZONTAL = 0.6   
 
+# Pulse Timing (Matches ESP32 Logic)
+TIME_LONG_MOVE = 5.0     # Forward (5s)
+TIME_REVERSE_MOVE = 2.0  # Reverse (2s) <-- NEW
+TIME_SHORT_MOVE = 0.8    # Left/Right (0.8s)
+
 # Stability Settings
-CHANGE_COOLDOWN = 0.8   # Increased to 0.8s to stop rapid flipping
 BLINK_RATIO_LIMIT = 5.2
 DOUBLE_BLINK_INTERVAL = 0.6
 
@@ -33,6 +37,7 @@ MEASURE_NOISE = 1e-1
 # ==============================================================================
 
 class SignalStabilizer:
+    """ Uses Kalman Filter to smooth out jittery eye tracking data. """
     def __init__(self):
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
@@ -49,6 +54,7 @@ class SignalStabilizer:
 
 
 class GazeTracker:
+    """ Handles Camera Input and MediaPipe math. """
     def __init__(self):
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
@@ -82,6 +88,7 @@ class GazeTracker:
 
 
 class WheelchairDriver:
+    """ Manages Logic and runs Bluetooth in a BACKGROUND THREAD. """
     def __init__(self):
         self.stabilizer = SignalStabilizer()
         self.calibrated = False
@@ -90,7 +97,10 @@ class WheelchairDriver:
         
         self.current_state = "STOP"
         self.last_sent_cmd = ""
-        self.last_state_change_time = 0
+        
+        # Pulse Logic Variables
+        self.pulse_active = False
+        self.pulse_end_time = 0
         
         self.blink_active = False
         self.last_blink_time = 0
@@ -107,7 +117,7 @@ class WheelchairDriver:
         asyncio.set_event_loop(loop)
         
         async def async_task():
-            while self.running: # Auto-Reconnect Loop
+            while self.running: 
                 print(f"[BLE] Scanning for {DEVICE_NAME}...")
                 try:
                     device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=5.0)
@@ -130,7 +140,13 @@ class WheelchairDriver:
                                                 "STOP": b'S', "IDLE": b'S'}
                                 char_code = protocol_map.get(cmd, b'S')
                                 
-                                if cmd != last_msg:
+                                # Priority: Send STOP immediately
+                                if cmd == "STOP":
+                                    print(f"[BLE] 🛑 EMERGENCY STOP SENT")
+                                    await client.write_gatt_char(CHARACTERISTIC_UUID, b'S', response=False)
+                                    last_msg = cmd
+                                # Otherwise, only send if changed
+                                elif cmd != last_msg:
                                     print(f"[BLE] Sending: {cmd}")
                                     await client.write_gatt_char(CHARACTERISTIC_UUID, char_code, response=False)
                                     last_msg = cmd
@@ -139,7 +155,7 @@ class WheelchairDriver:
                                 continue
                             except Exception as e:
                                 print(f"[BLE] Transmission Error: {e}")
-                                break # Break inner loop to trigger reconnect
+                                break 
                         
                         print("[BLE] Disconnected. Reconnecting...")
 
@@ -160,37 +176,74 @@ class WheelchairDriver:
 
     def update_logic(self, raw_x, raw_y, blink_val):
         smooth_x, smooth_y = self.stabilizer.update(raw_x, raw_y)
-        
+        now = time.time()
+
+        # --- 1. BLINK DETECTION (The Master Key) ---
+        # This runs FIRST to handle Unlocking from STOP
         if blink_val > BLINK_RATIO_LIMIT:
             if not self.blink_active:
                 self.blink_active = True
-                now = time.time()
+                # Check for DOUBLE BLINK
                 if (now - self.last_blink_time) < DOUBLE_BLINK_INTERVAL:
-                    self.current_state = "IDLE" if self.current_state == "STOP" else "STOP"
+                    print("!!! DOUBLE BLINK DETECTED !!!")
+                    
+                    # TOGGLE LOGIC:
+                    if self.current_state == "STOP":
+                        self.current_state = "IDLE" # UNLOCK
+                        self.pulse_active = False
+                        print("-> SYSTEM UNLOCKED (IDLE)")
+                    else:
+                        self.current_state = "STOP" # LOCK
+                        self.pulse_active = False
+                        print("-> EMERGENCY STOP (LOCKED)")
+                    
+                    self.last_blink_time = 0 
+                    return smooth_x, smooth_y, self.current_state
+
                 self.last_blink_time = now
         else:
             self.blink_active = False
 
-        if self.calibrated and not self.blink_active and self.current_state != "STOP":
-            now = time.time()
-            
-            # --- COOLDOWN CHECK ---
-            if (now - self.last_state_change_time) < CHANGE_COOLDOWN:
-                return smooth_x, smooth_y, self.current_state
+        # --- 2. STOP STATE LOCKOUT ---
+        if self.current_state == "STOP":
+            return smooth_x, smooth_y, "STOP"
 
+        # --- 3. PULSE TIMER CHECK ---
+        # If moving, lock logic until time is up
+        if self.pulse_active:
+            if now < self.pulse_end_time:
+                return smooth_x, smooth_y, self.current_state # Continue Pulse
+            else:
+                self.pulse_active = False
+                self.current_state = "IDLE"
+                return smooth_x, smooth_y, "IDLE" # Pulse Done
+
+        # --- 4. NEW COMMAND DETECTION ---
+        if self.calibrated:
             dx = smooth_x - self.center_x
             dy = smooth_y - self.center_y
             mag_x, mag_y = abs(dx), abs(dy)
             new_cmd = "IDLE"
 
+            # Cone Logic
             if mag_x > THRESH_X and mag_x > (mag_y * BIAS_HORIZONTAL):
                 new_cmd = "LEFT" if dx < 0 else "RIGHT"
             elif mag_y > THRESH_Y:
                 new_cmd = "FORWARD" if dy < 0 else "REVERSE"
             
-            if new_cmd != self.current_state:
+            # Start New Pulse with specific timing for each direction
+            if new_cmd != "IDLE":
                 self.current_state = new_cmd
-                self.last_state_change_time = now
+                self.pulse_active = True
+                
+                # Set Timer based on move type
+                if new_cmd == "FORWARD":
+                    self.pulse_end_time = now + TIME_LONG_MOVE
+                elif new_cmd == "REVERSE":
+                    self.pulse_end_time = now + TIME_REVERSE_MOVE # Uses 2.0s
+                else:
+                    # Left / Right
+                    self.pulse_end_time = now + TIME_SHORT_MOVE
 
         return smooth_x, smooth_y, self.current_state
 
@@ -223,7 +276,7 @@ def run_system():
             rx, ry, blink = tracker.process_landmarks(landmarks)
             sx, sy, state = driver.update_logic(rx, ry, blink)
             
-            # Queue Command
+            # Send Command
             if state != driver.last_sent_cmd:
                 driver.send_command(state)
                 driver.last_sent_cmd = state
@@ -241,6 +294,12 @@ def run_system():
                 gx = int(cx + (sx - driver.center_x) * 1000)
                 gy = int(cy + (sy - driver.center_y) * 1000)
                 cv2.arrowedLine(frame, (cx, cy), (gx, gy), color, 3, tipLength=0.3)
+                
+                # Show Pulse Countdown
+                if driver.pulse_active:
+                    remaining = int(driver.pulse_end_time - time.time())
+                    cv2.putText(frame, f"DRIVING... {remaining}s", (cx-50, cy+60), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             cv2.putText(frame, f"CMD: {state}", (20, 50), cv2.FONT_HERSHEY_DUPLEX, 1.2, color, 2)
             if not driver.calibrated:
