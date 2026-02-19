@@ -300,7 +300,7 @@ def run_system():
             # Current Command State
             cv2.putText(frame, f"CMD: {state}", (20, 50), cv2.FONT_HERSHEY_DUPLEX, 1.0, color, 2)
 
-            # LIVE SENSOR TELEMETRY
+            # LIV xE SENSOR TELEMETRY
             f_color = get_dist_color(driver.front_dist)
             r_color = get_dist_color(driver.rear_dist)
             
